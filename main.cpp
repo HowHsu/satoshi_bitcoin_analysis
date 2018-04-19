@@ -2605,6 +2605,11 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, in
                         if (pcoin->vout[nOut].IsMine())
                             SignSignature(*pcoin, wtxNew, nIn++);
 
+                /*
+                    index:0
+                    Author:HowHsu
+                    Comment:here is a ref about TX fee:https://zhuanlan.zhihu.com/p/24137223
+                */
                 // Check that enough fee is included
                 if (nFee < wtxNew.GetMinFee(true))
                 {

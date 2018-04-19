@@ -1,0 +1,31 @@
+if you'd like to add some comments,plz follow this format:
+/*
+index0
+Author:Alice
+Comment:....
+Question:...
+XXX's ans:...
+YYY's ans:...
+
+index:1
+Author:Bob
+Comment:...
+Question:...
+XXX's ans:...
+YYY's ans:...
+
+index:2
+Author:Your name
+Comment:
+    Your comments
+Question:
+    q1:
+    q2:
+XXX's ans:
+    a1:
+    a2:
+YYY's ans:
+    a1:
+    a2
+*/
+DO not put too many questions here,just some brief explanation.
