@@ -975,7 +975,10 @@ bool Solver(const CScript& scriptPubKey, vector<pair<opcodetype, valtype> >& vSo
     return false;
 }
 
-
+/*
+    Author:HowHsu
+    Comments:if hash equals 0,then we are not gonna sign but do some check(like CTxOut::IsMine)
+*/
 bool Solver(const CScript& scriptPubKey, uint256 hash, int nHashType, CScript& scriptSigRet)
 {
     scriptSigRet.clear();
