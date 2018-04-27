@@ -7,6 +7,7 @@ class CAddress;
 class CInv;
 class CRequestTracker;
 class CNode;
+class CBlockIndex;
 
 
 
@@ -20,20 +21,17 @@ enum
 
 
 
-
-
 bool ConnectSocket(const CAddress& addrConnect, SOCKET& hSocketRet);
 bool GetMyExternalIP(unsigned int& ipRet);
-bool AddAddress(CAddrDB& addrdb, const CAddress& addr);
+bool AddAddress(CAddrDB& addrdb, CAddress addr, bool fCurrentlyOnline=true);
+void AddressCurrentlyConnected(const CAddress& addr);
 CNode* FindNode(unsigned int ip);
 CNode* ConnectNode(CAddress addrConnect, int64 nTimeout=0);
 void AbandonRequests(void (*fn)(void*, CDataStream&), void* param1);
 bool AnySubscribed(unsigned int nChannel);
-void ThreadBitcoinMiner(void* parg);
-bool StartNode(string& strError=REF(string()));
+bool BindListenPort(string& strError=REF(string()));
+void StartNode(void* parg);
 bool StopNode();
-void CheckForShutdown(int n);
-
 
 
 
@@ -141,61 +139,77 @@ public:
     unsigned int nTime;
 
     // memory only
-    unsigned int nLastFailed;
+    unsigned int nLastTry;
 
     CAddress()
     {
-        nServices = 0;
-        memcpy(pchReserved, pchIPv4, sizeof(pchReserved));
-        ip = 0;
-        port = DEFAULT_PORT;
-        nTime = GetAdjustedTime();
-        nLastFailed = 0;
+        Init();
     }
 
-    CAddress(unsigned int ipIn, unsigned short portIn=DEFAULT_PORT, uint64 nServicesIn=0)
+    CAddress(unsigned int ipIn, unsigned short portIn=DEFAULT_PORT, uint64 nServicesIn=NODE_NETWORK)
     {
-        nServices = nServicesIn;
-        memcpy(pchReserved, pchIPv4, sizeof(pchReserved));
+        Init();
         ip = ipIn;
         port = portIn;
-        nTime = GetAdjustedTime();
-        nLastFailed = 0;
+        nServices = nServicesIn;
     }
 
-    explicit CAddress(const struct sockaddr_in& sockaddr, uint64 nServicesIn=0)
+    explicit CAddress(const struct sockaddr_in& sockaddr, uint64 nServicesIn=NODE_NETWORK)
     {
-        nServices = nServicesIn;
-        memcpy(pchReserved, pchIPv4, sizeof(pchReserved));
+        Init();
         ip = sockaddr.sin_addr.s_addr;
         port = sockaddr.sin_port;
-        nTime = GetAdjustedTime();
-        nLastFailed = 0;
+        nServices = nServicesIn;
     }
 
-    explicit CAddress(const char* pszIn, uint64 nServicesIn=0)
+    explicit CAddress(const char* pszIn, uint64 nServicesIn=NODE_NETWORK)
     {
+        Init();
+        SetAddress(pszIn);
         nServices = nServicesIn;
+    }
+
+    explicit CAddress(string strIn, uint64 nServicesIn=NODE_NETWORK)
+    {
+        Init();
+        SetAddress(strIn.c_str());
+        nServices = nServicesIn;
+    }
+
+    void Init()
+    {
+        nServices = NODE_NETWORK;
         memcpy(pchReserved, pchIPv4, sizeof(pchReserved));
-        ip = 0;
+        ip = INADDR_NONE;
         port = DEFAULT_PORT;
         nTime = GetAdjustedTime();
-        nLastFailed = 0;
+        nLastTry = 0;
+    }
 
+    bool SetAddress(const char* pszIn)
+    {
+        ip = INADDR_NONE;
+        port = DEFAULT_PORT;
         char psz[100];
-        if (strlen(pszIn) > ARRAYLEN(psz)-1)
-            return;
-        strcpy(psz, pszIn);
-        unsigned int a, b, c, d, e;
+        strlcpy(psz, pszIn, sizeof(psz));
+        unsigned int a=0, b=0, c=0, d=0, e=0;
         if (sscanf(psz, "%u.%u.%u.%u:%u", &a, &b, &c, &d, &e) < 4)
-            return;
+            return false;
         char* pszPort = strchr(psz, ':');
         if (pszPort)
         {
             *pszPort++ = '\0';
             port = htons(atoi(pszPort));
+            if (atoi(pszPort) < 0 || atoi(pszPort) > USHRT_MAX)
+                port = htons(USHRT_MAX);
         }
         ip = inet_addr(psz);
+        return IsValid();
+    }
+
+    bool SetAddress(string strIn)
+    {
+        return SetAddress(strIn.c_str());
     }
 
     IMPLEMENT_SERIALIZE
@@ -206,7 +220,7 @@ public:
             READWRITE(nTime);
         }
         READWRITE(nServices);
-        READWRITE(FLATDATA(pchReserved));
+        READWRITE(FLATDATA(pchReserved)); // for IPv6
         READWRITE(ip);
         READWRITE(port);
     )
@@ -216,6 +230,11 @@ public:
         return (memcmp(a.pchReserved, b.pchReserved, sizeof(a.pchReserved)) == 0 &&
                 a.ip   == b.ip &&
                 a.port == b.port);
+    }
+
+    friend inline bool operator!=(const CAddress& a, const CAddress& b)
+    {
+        return (!(a == b));
     }
 
     friend inline bool operator<(const CAddress& a, const CAddress& b)
@@ -249,6 +268,7 @@ public:
     struct sockaddr_in GetSockAddr() const
     {
         struct sockaddr_in sockaddr;
+        memset(&sockaddr, 0, sizeof(sockaddr));
         sockaddr.sin_family = AF_INET;
         sockaddr.sin_addr.s_addr = ip;
         sockaddr.sin_port = port;
@@ -262,7 +282,17 @@ public:
 
     bool IsRoutable() const
     {
-        return !(GetByte(3) == 10 || (GetByte(3) == 192 && GetByte(2) == 168) || GetByte(3) == 127 || GetByte(3) == 0);
+        return !(GetByte(3) == 10 ||
+                 (GetByte(3) == 192 && GetByte(2) == 168) ||
+                 GetByte(3) == 127 ||
+                 GetByte(3) == 0 ||
+                 ip == 0 ||
+                 ip == INADDR_NONE);
+    }
+
+    bool IsValid() const
+    {
+        return (ip != 0 && ip != INADDR_NONE && port != htons(USHRT_MAX));
     }
 
     unsigned char GetByte(int n) const
@@ -280,10 +310,19 @@ public:
         return strprintf("%u.%u.%u.%u", GetByte(3), GetByte(2), GetByte(1), GetByte(0));
     }
 
+    string ToStringPort() const
+    {
+        return strprintf("%u", ntohs(port));
+    }
+
+    string ToStringLog() const
+    {
+        return "";
+    }
+
     string ToString() const
     {
         return strprintf("%u.%u.%u.%u:%u", GetByte(3), GetByte(2), GetByte(1), GetByte(0), ntohs(port));
-        //return strprintf("%u.%u.%u.%u", GetByte(3), GetByte(2), GetByte(1), GetByte(0));
     }
 
     void print() const
@@ -376,7 +415,7 @@ public:
 
     string ToString() const
     {
-        return strprintf("%s %s", GetCommand(), hash.ToString().substr(0,14).c_str());
+        return strprintf("%s %s", GetCommand(), hash.ToString().substr(0,16).c_str());
     }
 
     void print() const
@@ -415,8 +454,11 @@ extern bool fClient;
 extern uint64 nLocalServices;
 extern CAddress addrLocalHost;
 extern CNode* pnodeLocalHost;
-extern bool fShutdown;
-extern array<bool, 10> vfThreadRunning;
+extern uint64 nLocalHostNonce;
+extern array<int, 10> vnThreadsRunning;
+extern SOCKET hListenSocket;
+extern int64 nThreadSocketHandlerHeartbeat;
+
 extern vector<CNode*> vNodes;
 extern CCriticalSection cs_vNodes;
 extern map<vector<unsigned char>, CAddress> mapAddresses;
@@ -425,6 +467,9 @@ extern map<CInv, CDataStream> mapRelay;
 extern deque<pair<int64, CInv> > vRelayExpiration;
 extern CCriticalSection cs_mapRelay;
 extern map<CInv, int64> mapAlreadyAskedFor;
+
+// Settings
+extern int fUseProxy;
 extern CAddress addrProxy;
 
 
@@ -441,12 +486,17 @@ public:
     CDataStream vRecv;
     CCriticalSection cs_vSend;
     CCriticalSection cs_vRecv;
+    int64 nLastSend;
+    int64 nLastRecv;
+    int64 nLastSendEmpty;
+    int64 nTimeConnected;
     unsigned int nPushPos;
     CAddress addr;
     int nVersion;
     bool fClient;
     bool fInbound;
     bool fNetworkNode;
+    bool fSuccessfullyConnected;
     bool fDisconnect;
 protected:
     int nRefCount;
@@ -454,14 +504,17 @@ public:
     int64 nReleaseTime;
     map<uint256, CRequestTracker> mapRequests;
     CCriticalSection cs_mapRequests;
+    uint256 hashContinue;
+    CBlockIndex* pindexLastGetBlocksBegin;
+    uint256 hashLastGetBlocksEnd;
 
     // flood
     vector<CAddress> vAddrToSend;
     set<CAddress> setAddrKnown;
+    bool fGetAddr;
 
     // inventory based relay
     set<CInv> setInventoryKnown;
-    set<CInv> setInventoryKnown2;
     vector<CInv> vInventoryToSend;
     CCriticalSection cs_inventory;
     multimap<int64, CInv> mapAskFor;
@@ -476,27 +529,42 @@ public:
         hSocket = hSocketIn;
         vSend.SetType(SER_NETWORK);
         vRecv.SetType(SER_NETWORK);
+        nLastSend = 0;
+        nLastRecv = 0;
+        nLastSendEmpty = GetTime();
+        nTimeConnected = GetTime();
         nPushPos = -1;
         addr = addrIn;
         nVersion = 0;
         fClient = false; // set by version message
         fInbound = fInboundIn;
         fNetworkNode = false;
+        fSuccessfullyConnected = false;
         fDisconnect = false;
         nRefCount = 0;
         nReleaseTime = 0;
+        hashContinue = 0;
+        pindexLastGetBlocksBegin = 0;
+        hashLastGetBlocksEnd = 0;
+        fGetAddr = false;
         vfSubscribe.assign(256, false);
 
         // Push a version message
         /// when NTP implemented, change to just nTime = GetAdjustedTime()
         int64 nTime = (fInbound ? GetAdjustedTime() : GetTime());
-        PushMessage("version", VERSION, nLocalServices, nTime, addr);
+        CAddress addrYou = (fUseProxy ? CAddress("0.0.0.0") : addr);
+        CAddress addrMe = (fUseProxy ? CAddress("0.0.0.0") : addrLocalHost);
+        RAND_bytes((unsigned char*)&nLocalHostNonce, sizeof(nLocalHostNonce));
+        PushMessage("version", VERSION, nLocalServices, nTime, addrYou, addrMe, nLocalHostNonce, string(pszSubVer));
     }
 
     ~CNode()
     {
         if (hSocket != INVALID_SOCKET)
+        {
             closesocket(hSocket);
+            hSocket = INVALID_SOCKET;
+        }
     }
 
 private:
@@ -505,22 +573,18 @@ private:
 public:
 
 
-    bool ReadyToDisconnect()
-    {
-        return fDisconnect || GetRefCount() <= 0;
-    }
-
     int GetRefCount()
     {
         return max(nRefCount, 0) + (GetTime() < nReleaseTime ? 1 : 0);
     }
 
-    void AddRef(int64 nTimeout=0)
+    CNode* AddRef(int64 nTimeout=0)
     {
         if (nTimeout != 0)
             nReleaseTime = max(nReleaseTime, GetTime() + nTimeout);
         else
             nRefCount++;
+        return this;
     }
 
     void Release()
@@ -528,6 +592,21 @@ public:
         nRefCount--;
     }
 
+
+
+    void AddAddressKnown(const CAddress& addr)
+    {
+        setAddrKnown.insert(addr);
+    }
+
+    void PushAddress(const CAddress& addr)
+    {
+        // Known checking here is only to save space from duplicates.
+        // SendMessages will filter it again for knowns that were added
+        // after addresses were pushed.
+        if (!setAddrKnown.count(addr))
+            vAddrToSend.push_back(addr);
+    }
 
 
     void AddInventoryKnown(const CInv& inv)
@@ -548,7 +627,7 @@ public:
         // We're using mapAskFor as a priority queue,
         // the key is the earliest time the request can be sent
         int64& nRequestTime = mapAlreadyAskedFor[inv];
-        printf("askfor %s  %I64d\n", inv.ToString().c_str(), nRequestTime);
+        printf("askfor %s  %"PRI64d"\n", inv.ToString().c_str(), nRequestTime);
 
         // Make sure not to reuse time indexes to keep things in the same order
         int64 nNow = (GetTime() - 1) * 1000000;
@@ -564,12 +643,14 @@ public:
 
     void BeginMessage(const char* pszCommand)
     {
-        EnterCriticalSection(&cs_vSend);
+        cs_vSend.Enter();
         if (nPushPos != -1)
             AbortMessage();
         nPushPos = vSend.size();
         vSend << CMessageHeader(pszCommand, 0);
-        printf("sending: %-12s ", pszCommand);
+        if (fDebug)
+            printf("%s ", DateTimeStrFormat("%x %H:%M:%S", GetTime()).c_str());
+        printf("sending: %s ", pszCommand);
     }
 
     void AbortMessage()
@@ -578,14 +659,13 @@ public:
             return;
         vSend.resize(nPushPos);
         nPushPos = -1;
-        LeaveCriticalSection(&cs_vSend);
+        cs_vSend.Leave();
         printf("(aborted)\n");
     }
 
     void EndMessage()
     {
-        extern int nDropMessagesTest;
-        if (nDropMessagesTest > 0 && GetRand(nDropMessagesTest) == 0)
+        if (mapArgs.count("-dropmessagestest") && GetRand(atoi(mapArgs["-dropmessagestest"])) == 0)
         {
             printf("dropmessages DROPPING SEND MESSAGE\n");
             AbortMessage();
@@ -599,13 +679,11 @@ public:
         unsigned int nSize = vSend.size() - nPushPos - sizeof(CMessageHeader);
         memcpy((char*)&vSend[nPushPos] + offsetof(CMessageHeader, nMessageSize), &nSize, sizeof(nSize));
 
-        printf("(%d bytes)  ", nSize);
-        //for (int i = nPushPos+sizeof(CMessageHeader); i < min(vSend.size(), nPushPos+sizeof(CMessageHeader)+20U); i++)
-        //    printf("%02x ", vSend[i] & 0xff);
+        printf("(%d bytes) ", nSize);
         printf("\n");
 
         nPushPos = -1;
-        LeaveCriticalSection(&cs_vSend);
+        cs_vSend.Leave();
     }
 
     void EndMessageAbortIfEmpty()
@@ -707,6 +785,86 @@ public:
         }
     }
 
+    template<typename T1, typename T2, typename T3, typename T4, typename T5>
+    void PushMessage(const char* pszCommand, const T1& a1, const T2& a2, const T3& a3, const T4& a4, const T5& a5)
+    {
+        try
+        {
+            BeginMessage(pszCommand);
+            vSend << a1 << a2 << a3 << a4 << a5;
+            EndMessage();
+        }
+        catch (...)
+        {
+            AbortMessage();
+            throw;
+        }
+    }
+
+    template<typename T1, typename T2, typename T3, typename T4, typename T5, typename T6>
+    void PushMessage(const char* pszCommand, const T1& a1, const T2& a2, const T3& a3, const T4& a4, const T5& a5, const T6& a6)
+    {
+        try
+        {
+            BeginMessage(pszCommand);
+            vSend << a1 << a2 << a3 << a4 << a5 << a6;
+            EndMessage();
+        }
+        catch (...)
+        {
+            AbortMessage();
+            throw;
+        }
+    }
+
+    template<typename T1, typename T2, typename T3, typename T4, typename T5, typename T6, typename T7>
+    void PushMessage(const char* pszCommand, const T1& a1, const T2& a2, const T3& a3, const T4& a4, const T5& a5, const T6& a6, const T7& a7)
+    {
+        try
+        {
+            BeginMessage(pszCommand);
+            vSend << a1 << a2 << a3 << a4 << a5 << a6 << a7;
+            EndMessage();
+        }
+        catch (...)
+        {
+            AbortMessage();
+            throw;
+        }
+    }
+
+    template<typename T1, typename T2, typename T3, typename T4, typename T5, typename T6, typename T7, typename T8>
+    void PushMessage(const char* pszCommand, const T1& a1, const T2& a2, const T3& a3, const T4& a4, const T5& a5, const T6& a6, const T7& a7, const T8& a8)
+    {
+        try
+        {
+            BeginMessage(pszCommand);
+            vSend << a1 << a2 << a3 << a4 << a5 << a6 << a7 << a8;
+            EndMessage();
+        }
+        catch (...)
+        {
+            AbortMessage();
+            throw;
+        }
+    }
+
+    template<typename T1, typename T2, typename T3, typename T4, typename T5, typename T6, typename T7, typename T8, typename T9>
+    void PushMessage(const char* pszCommand, const T1& a1, const T2& a2, const T3& a3, const T4& a4, const T5& a5, const T6& a6, const T7& a7, const T8& a8, const T9& a9)
+    {
+        try
+        {
+            BeginMessage(pszCommand);
+            vSend << a1 << a2 << a3 << a4 << a5 << a6 << a7 << a8 << a9;
+            EndMessage();
+        }
+        catch (...)
+        {
+            AbortMessage();
+            throw;
+        }
+    }
+
 
     void PushRequest(const char* pszCommand,
                      void (*fn)(void*, CDataStream&), void* param1)
@@ -748,10 +906,12 @@ public:
 
 
 
+    void PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd);
     bool IsSubscribed(unsigned int nChannel);
     void Subscribe(unsigned int nChannel, unsigned int nHops=0);
     void CancelSubscribe(unsigned int nChannel);
-    void Disconnect();
+    void CloseSocketDisconnect();
+    void Cleanup();
 };
 
 

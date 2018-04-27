@@ -5,21 +5,26 @@
 #include "headers.h"
 
 
-
+map<string, string> mapArgs;
+map<string, vector<string> > mapMultiArgs;
 bool fDebug = false;
+bool fPrintToDebugger = false;
+bool fPrintToConsole = false;
+char pszSetDataDir[MAX_PATH] = "";
+bool fShutdown = false;
+
 
 
 
 
 // Init openssl library multithreading support
-static HANDLE* lock_cs;
-
-void win32_locking_callback(int mode, int type, const char* file, int line)
+static wxMutex** ppmutexOpenSSL;
+void locking_callback(int mode, int i, const char* file, int line)
 {
     if (mode & CRYPTO_LOCK)
-        WaitForSingleObject(lock_cs[type], INFINITE);
+        ppmutexOpenSSL[i]->Lock();
     else
-        ReleaseMutex(lock_cs[type]);
+        ppmutexOpenSSL[i]->Unlock();
 }
 
 // Init
@@ -29,24 +34,26 @@ public:
     CInit()
     {
         // Init openssl library multithreading support
-        lock_cs = (HANDLE*)OPENSSL_malloc(CRYPTO_num_locks() * sizeof(HANDLE));
+        ppmutexOpenSSL = (wxMutex**)OPENSSL_malloc(CRYPTO_num_locks() * sizeof(wxMutex*));
         for (int i = 0; i < CRYPTO_num_locks(); i++)
-            lock_cs[i] = CreateMutex(NULL,FALSE,NULL);
-        CRYPTO_set_locking_callback(win32_locking_callback);
+            ppmutexOpenSSL[i] = new wxMutex();
+        CRYPTO_set_locking_callback(locking_callback);
 
+#ifdef __WXMSW__
         // Seed random number generator with screen scrape and other hardware sources
         RAND_screen();
+#endif
 
-        // Seed random number generator with perfmon data
-        RandAddSeed(true);
+        // Seed random number generator with performance counter
+        RandAddSeed();
     }
     ~CInit()
     {
         // Shutdown openssl library multithreading support
         CRYPTO_set_locking_callback(NULL);
-        for (int i =0 ; i < CRYPTO_num_locks(); i++)
-            CloseHandle(lock_cs[i]);
-        OPENSSL_free(lock_cs);
+        for (int i = 0; i < CRYPTO_num_locks(); i++)
+            delete ppmutexOpenSSL[i];
+        OPENSSL_free(ppmutexOpenSSL);
     }
 }
 instance_of_cinit;
@@ -54,42 +61,66 @@ instance_of_cinit;
 
 
 
-void RandAddSeed(bool fPerfmon)
+
+
+
+
+void RandAddSeed()
 {
     // Seed with CPU performance counter
-    LARGE_INTEGER PerformanceCount;
-    QueryPerformanceCounter(&PerformanceCount);
-    RAND_add(&PerformanceCount, sizeof(PerformanceCount), 1.5);
-    memset(&PerformanceCount, 0, sizeof(PerformanceCount));
-
-    static int64 nLastPerfmon;
-    if (fPerfmon || GetTime() > nLastPerfmon + 5 * 60)
-    {
-        nLastPerfmon = GetTime();
-
-        // Seed with the entire set of perfmon data
-        unsigned char pdata[250000];
-        memset(pdata, 0, sizeof(pdata));
-        unsigned long nSize = sizeof(pdata);
-        long ret = RegQueryValueEx(HKEY_PERFORMANCE_DATA, "Global", NULL, NULL, pdata, &nSize);
-        RegCloseKey(HKEY_PERFORMANCE_DATA);
-        if (ret == ERROR_SUCCESS)
-        {
-            uint256 hash;
-            SHA256(pdata, nSize, (unsigned char*)&hash);
-            RAND_add(&hash, sizeof(hash), min(nSize/500.0, (double)sizeof(hash)));
-            hash = 0;
-            memset(pdata, 0, nSize);
-
-            time_t nTime;
-            time(&nTime);
-            struct tm* ptmTime = gmtime(&nTime);
-            char pszTime[200];
-            strftime(pszTime, sizeof(pszTime), "%x %H:%M:%S", ptmTime);
-            printf("%s  RandAddSeed() got %d bytes of performance data\n", pszTime, nSize);
-        }
-    }
+    int64 nCounter = PerformanceCounter();
+    RAND_add(&nCounter, sizeof(nCounter), 1.5);
+    memset(&nCounter, 0, sizeof(nCounter));
 }
+
+void RandAddSeedPerfmon()
+{
+    // This can take up to 2 seconds, so only do it every 10 minutes
+    static int64 nLastPerfmon;
+    if (GetTime() < nLastPerfmon + 10 * 60)
+        return;
+    nLastPerfmon = GetTime();
+
+#ifdef __WXMSW__
+    // Don't need this on Linux, OpenSSL automatically uses /dev/urandom
+    // Seed with the entire set of perfmon data
+    unsigned char pdata[250000];
+    memset(pdata, 0, sizeof(pdata));
+    unsigned long nSize = sizeof(pdata);
+    long ret = RegQueryValueEx(HKEY_PERFORMANCE_DATA, "Global", NULL, NULL, pdata, &nSize);
+    RegCloseKey(HKEY_PERFORMANCE_DATA);
+    if (ret == ERROR_SUCCESS)
+    {
+        uint256 hash;
+        SHA256(pdata, nSize, (unsigned char*)&hash);
+        RAND_add(&hash, sizeof(hash), min(nSize/500.0, (double)sizeof(hash)));
+        hash = 0;
+        memset(pdata, 0, nSize);
+
+        printf("%s RandAddSeed() %d bytes\n", DateTimeStrFormat("%x %H:%M:%S", GetTime()).c_str(), nSize);
+    }
+#else
+    printf("%s RandAddSeed()\n", DateTimeStrFormat("%x %H:%M:%S", GetTime()).c_str());
+#endif
+}
+
+uint64 GetRand(uint64 nMax)
+{
+    if (nMax == 0)
+        return 0;
+
+    // The range of the random source must be a multiple of the modulus
+    // to give every possible output value an equal possibility
+    uint64 nRange = (UINT64_MAX / nMax) * nMax;
+    uint64 nRand = 0;
+    do
+        RAND_bytes((unsigned char*)&nRand, sizeof(nRand));
+    while (nRand >= nRange);
+    return (nRand % nMax);
+}
+
+
+
 
 
 
@@ -172,27 +203,6 @@ bool error(const char* format, ...)
 }
 
 
-void PrintException(std::exception* pex, const char* pszThread)
-{
-    char pszModule[260];
-    pszModule[0] = '\0';
-    GetModuleFileName(NULL, pszModule, sizeof(pszModule));
-    _strlwr(pszModule);
-    char pszMessage[1000];
-    if (pex)
-        snprintf(pszMessage, sizeof(pszMessage),
-            "EXCEPTION: %s       \n%s       \n%s in %s       \n", typeid(*pex).name(), pex->what(), pszModule, pszThread);
-    else
-        snprintf(pszMessage, sizeof(pszMessage),
-            "UNKNOWN EXCEPTION       \n%s in %s       \n", pszModule, pszThread);
-    printf("\n\n************************\n%s", pszMessage);
-    if (wxTheApp)
-        wxMessageBox(pszMessage, "Error", wxOK | wxICON_ERROR);
-    throw;
-    //DebugBreak();
-}
-
-
 void ParseString(const string& str, char c, vector<string>& v)
 {
     unsigned int i1 = 0;
@@ -210,7 +220,7 @@ void ParseString(const string& str, char c, vector<string>& v)
 string FormatMoney(int64 n, bool fPlus)
 {
     n /= CENT;
-    string str = strprintf("%I64d.%02I64d", (n > 0 ? n : -n)/100, (n > 0 ? n : -n)%100);
+    string str = strprintf("%"PRI64d".%02"PRI64d, (n > 0 ? n : -n)/100, (n > 0 ? n : -n)%100);
     for (int i = 6; i < str.size(); i += 4)
         if (isdigit(str[str.size() - i - 1]))
             str.insert(str.size() - i, 1, ',');
@@ -268,21 +278,169 @@ bool ParseMoney(const char* pszIn, int64& nRet)
 }
 
 
-
-
-
-
-
-
-
-
-bool FileExists(const char* psz)
+vector<unsigned char> ParseHex(const char* psz)
 {
-#ifdef WIN32
-    return GetFileAttributes(psz) != -1;
+    vector<unsigned char> vch;
+    while (isspace(*psz))
+        psz++;
+    vch.reserve((strlen(psz)+1)/3);
+
+    static char phexdigit[256] =
+    { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      0,1,2,3,4,5,6,7,8,9,-1,-1,-1,-1,-1,-1,
+      -1,0xa,0xb,0xc,0xd,0xe,0xf,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,0xa,0xb,0xc,0xd,0xe,0xf,-1,-1,-1,-1,-1,-1,-1,-1,-1
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+      -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, };
+
+    while (*psz)
+    {
+        char c = phexdigit[(unsigned char)*psz++];
+        if (c == -1)
+            break;
+        unsigned char n = (c << 4);
+        if (*psz)
+        {
+            char c = phexdigit[(unsigned char)*psz++];
+            if (c == -1)
+                break;
+            n |= c;
+            vch.push_back(n);
+        }
+        while (isspace(*psz))
+            psz++;
+    }
+
+    return vch;
+}
+
+vector<unsigned char> ParseHex(const std::string& str)
+{
+    return ParseHex(str.c_str());
+}
+
+
+void ParseParameters(int argc, char* argv[])
+{
+    mapArgs.clear();
+    mapMultiArgs.clear();
+    for (int i = 0; i < argc; i++)
+    {
+        char psz[10000];
+        strlcpy(psz, argv[i], sizeof(psz));
+        char* pszValue = (char*)"";
+        if (strchr(psz, '='))
+        {
+            pszValue = strchr(psz, '=');
+            *pszValue++ = '\0';
+        }
+        #ifdef __WXMSW__
+        _strlwr(psz);
+        if (psz[0] == '/')
+            psz[0] = '-';
+        #endif
+        mapArgs[psz] = pszValue;
+        mapMultiArgs[psz].push_back(pszValue);
+    }
+}
+
+
+
+
+
+
+
+void FormatException(char* pszMessage, std::exception* pex, const char* pszThread)
+{
+#ifdef __WXMSW__
+    char pszModule[MAX_PATH];
+    pszModule[0] = '\0';
+    GetModuleFileName(NULL, pszModule, sizeof(pszModule));
 #else
-    return access(psz, 0) != -1;
+    // might not be thread safe, uses wxString
+    //const char* pszModule = wxStandardPaths::Get().GetExecutablePath().mb_str();
+    const char* pszModule = "bitcoin";
 #endif
+    if (pex)
+        snprintf(pszMessage, 1000,
+            "EXCEPTION: %s       \n%s       \n%s in %s       \n", typeid(*pex).name(), pex->what(), pszModule, pszThread);
+    else
+        snprintf(pszMessage, 1000,
+            "UNKNOWN EXCEPTION       \n%s in %s       \n", pszModule, pszThread);
+}
+
+void LogException(std::exception* pex, const char* pszThread)
+{
+    char pszMessage[1000];
+    FormatException(pszMessage, pex, pszThread);
+    printf("\n%s", pszMessage);
+}
+
+void PrintException(std::exception* pex, const char* pszThread)
+{
+    char pszMessage[1000];
+    FormatException(pszMessage, pex, pszThread);
+    printf("\n\n************************\n%s\n", pszMessage);
+    if (wxTheApp)
+        wxMessageBox(pszMessage, "Error", wxOK | wxICON_ERROR);
+    throw;
+    //DebugBreak();
+}
+
+
+
+
+
+
+
+
+void GetDataDir(char* pszDir)
+{
+    // pszDir must be at least MAX_PATH length.
+    if (pszSetDataDir[0] != 0)
+    {
+        strlcpy(pszDir, pszSetDataDir, MAX_PATH);
+        static bool fMkdirDone;
+        if (!fMkdirDone)
+        {
+            fMkdirDone = true;
+            _mkdir(pszDir);
+        }
+    }
+    else
+    {
+        // This can be called during exceptions by printf, so we cache the
+        // value so we don't have to do memory allocations after that.
+        // wxStandardPaths::GetUserDataDir
+        //  Return the directory for the user-dependent application data files:
+        //  Unix: ~/.appname
+        //  Windows: C:\Documents and Settings\username\Application Data\appname
+        //  Mac: ~/Library/Application Support/appname
+        static char pszCachedDir[MAX_PATH];
+        if (pszCachedDir[0] == 0)
+        {
+            strlcpy(pszCachedDir, wxStandardPaths::Get().GetUserDataDir().c_str(), sizeof(pszCachedDir));
+            _mkdir(pszCachedDir);
+        }
+        strlcpy(pszDir, pszCachedDir, MAX_PATH);
+    }
+}
+
+string GetDataDir()
+{
+    char pszDir[MAX_PATH];
+    GetDataDir(pszDir);
+    return pszDir;
 }
 
 int GetFilesize(FILE* file)
@@ -295,27 +453,26 @@ int GetFilesize(FILE* file)
     return nFilesize;
 }
 
-
-
-
-
-
-
-
-uint64 GetRand(uint64 nMax)
+void ShrinkDebugFile()
 {
-    if (nMax == 0)
-        return 0;
-
-    // The range of the random source must be a multiple of the modulus
-    // to give every possible output value an equal possibility
-    uint64 nRange = (_UI64_MAX / nMax) * nMax;
-    uint64 nRand = 0;
-    do
-        RAND_bytes((unsigned char*)&nRand, sizeof(nRand));
-    while (nRand >= nRange);
-    return (nRand % nMax);
+    // Scroll debug.log if it's getting too big
+    string strFile = GetDataDir() + "/debug.log";
+    FILE* file = fopen(strFile.c_str(), "r");
+    if (file && GetFilesize(file) > 10 * 1000000)
+    {
+        // Restart the file with some of the end
+        char pch[200000];
+        fseek(file, -sizeof(pch), SEEK_END);
+        int nBytes = fread(pch, 1, sizeof(pch), file);
+        fclose(file);
+        if (file = fopen(strFile.c_str(), "w"))
+        {
+            fwrite(pch, 1, nBytes, file);
+            fclose(file);
+        }
+    }
 }
+
 
 
 
@@ -336,7 +493,6 @@ uint64 GetRand(uint64 nMax)
 // note: NTP isn't implemented yet, so until then we just use the median
 //  of other nodes clocks to correct ours.
 //
-
 int64 GetTime()
 {
     return time(NULL);
@@ -363,7 +519,7 @@ void AddTimeData(unsigned int ip, int64 nTime)
     if (vTimeOffsets.empty())
         vTimeOffsets.push_back(0);
     vTimeOffsets.push_back(nOffsetSample);
-    printf("Added time data, samples %d, ip %08x, offset %+I64d (%+I64d minutes)\n", vTimeOffsets.size(), ip, vTimeOffsets.back(), vTimeOffsets.back()/60);
+    printf("Added time data, samples %d, offset %+"PRI64d" (%+"PRI64d" minutes)\n", vTimeOffsets.size(), vTimeOffsets.back(), vTimeOffsets.back()/60);
     if (vTimeOffsets.size() >= 5 && vTimeOffsets.size() % 2 == 1)
     {
         sort(vTimeOffsets.begin(), vTimeOffsets.end());
@@ -377,7 +533,7 @@ void AddTimeData(unsigned int ip, int64 nTime)
             ///    to make sure it doesn't get changed again
         }
         foreach(int64 n, vTimeOffsets)
-            printf("%+I64d  ", n);
-        printf("|  nTimeOffset = %+I64d  (%+I64d minutes)\n", nTimeOffset, nTimeOffset/60);
+            printf("%+"PRI64d"  ", n);
+        printf("|  nTimeOffset = %+"PRI64d"  (%+"PRI64d" minutes)\n", nTimeOffset, nTimeOffset/60);
     }
 }
