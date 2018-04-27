@@ -2815,6 +2815,12 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CK
                         if (pcoin->vout[nOut].IsMine())
                             SignSignature(*pcoin, wtxNew, nIn++);
 
+                /*   
+                    Author:HowHsu
+                    Comment:here is a ref about TX fee:https://zhuanlan.zhihu.com/p/24137223
+                            the fee depends on the size of the TX,and the TX depends on the fee too(by deciding which pre-TX to be included).
+                            this 'if' is a key point of this function.if you don't understand the above explanation,plz figure out why 'continue'
+                                                                                                                                 */
                 // Check that enough fee is included
                 if (nFee < wtxNew.GetMinFee())
                 {
