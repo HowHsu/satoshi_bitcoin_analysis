@@ -34,13 +34,15 @@ extern int nBestHeight;
 extern uint256 hashBestChain;
 extern CBlockIndex* pindexBest;
 extern unsigned int nTransactionsUpdated;
-extern string strSetDataDir;
-extern int nDropMessagesTest;
+extern map<uint256, int> mapRequestCount;
+extern CCriticalSection cs_mapRequestCount;
 
 // Settings
 extern int fGenerateBitcoins;
 extern int64 nTransactionFee;
 extern CAddress addrIncoming;
+extern int fLimitProcessors;
+extern int nLimitProcessors;
 
 
 
@@ -48,7 +50,6 @@ extern CAddress addrIncoming;
 
 
 
-string GetAppDir();
 bool CheckDiskSpace(int64 nAdditionalBytes=0);
 FILE* OpenBlockFile(unsigned int nFile, unsigned int nBlockPos, const char* pszMode="rb");
 FILE* AppendBlockFile(unsigned int& nFileRet);
@@ -59,14 +60,17 @@ void ReacceptWalletTransactions();
 void RelayWalletTransactions();
 bool LoadBlockIndex(bool fAllowNew=true);
 void PrintBlockTree();
-bool BitcoinMiner();
 bool ProcessMessages(CNode* pfrom);
 bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv);
 bool SendMessages(CNode* pto);
 int64 GetBalance();
-bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& txNew, int64& nFeeRequiredRet);
-bool CommitTransactionSpent(const CWalletTx& wtxNew);
+bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CKey& keyRet, int64& nFeeRequiredRet);
+bool CommitTransactionSpent(const CWalletTx& wtxNew, const CKey& key);
 bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew);
+void GenerateBitcoins(bool fGenerate);
+void ThreadBitcoinMiner(void* parg);
+void BitcoinMiner();
+
 
 
 
@@ -339,7 +343,7 @@ public:
     {
         if (scriptPubKey.size() < 6)
             return "CTxOut(error)";
-        return strprintf("CTxOut(nValue=%I64d.%08I64d, scriptPubKey=%s)", nValue / COIN, nValue % COIN, scriptPubKey.ToString().substr(0,24).c_str());
+        return strprintf("CTxOut(nValue=%"PRI64d".%08"PRI64d", scriptPubKey=%s)", nValue / COIN, nValue % COIN, scriptPubKey.ToString().substr(0,24).c_str());
     }
 
     void print() const
@@ -361,7 +365,7 @@ public:
     int nVersion;
     vector<CTxIn> vin;
     vector<CTxOut> vout;
-    int nLockTime;
+    unsigned int nLockTime;
 
 
     CTransaction()
@@ -396,9 +400,15 @@ public:
         return SerializeHash(*this);
     }
 
-    bool IsFinal() const
+    bool IsFinal(int64 nBlockTime=0) const
     {
-        if (nLockTime == 0 || nLockTime < nBestHeight)
+        // Time based nLockTime implemented in 0.1.6,
+        // do not use time based until most 0.1.5 nodes have upgraded.
+        if (nLockTime == 0)
+            return true;
+        if (nBlockTime == 0)
+            nBlockTime = GetAdjustedTime();
+        if (nLockTime < (nLockTime < 500000000 ? nBestHeight : nBlockTime))
             return true;
         foreach(const CTxIn& txin, vin)
             if (!txin.IsFinal())
@@ -502,14 +512,19 @@ public:
         return nValueOut;
     }
 
-    int64 GetMinFee(bool fDiscount=false) const
+    int64 GetMinFee(unsigned int nBlockSize=1) const
     {
         // Base fee is 1 cent per kilobyte
         unsigned int nBytes = ::GetSerializeSize(*this, SER_NETWORK);
         int64 nMinFee = (1 + (int64)nBytes / 1000) * CENT;
 
-        // First 100 transactions in a block are free
-        if (fDiscount && nBytes < 10000)
+        // Transactions under 60K are free as long as block size is under 80K
+        // (about 27,000bc if made of 50bc inputs)
+        if (nBytes < 60000 && nBlockSize < 80000)
+            nMinFee = 0;
+
+        // Transactions under 3K are free as long as block size is under 200K
+        if (nBytes < 3000 && nBlockSize < 200000)
             nMinFee = 0;
 
         // To limit dust spam, require a 0.01 fee if any output is less than 0.01
@@ -616,6 +631,8 @@ public:
 
     // memory only
     mutable bool fMerkleVerified;
+    mutable bool fGetCreditCached;
+    mutable int64 nGetCreditCached;
 
 
     CMerkleTx()
@@ -633,14 +650,8 @@ public:
         hashBlock = 0;
         nIndex = -1;
         fMerkleVerified = false;
-    }
-
-    int64 GetCredit() const
-    {
-        // Must wait until coinbase is safely deep enough in the chain before valuing it
-        if (IsCoinBase() && GetBlocksToMaturity() > 0)
-            return 0;
-        return CTransaction::GetCredit();
+        fGetCreditCached = false;
+        nGetCreditCached = 0;
     }
 
     IMPLEMENT_SERIALIZE
@@ -651,6 +662,20 @@ public:
         READWRITE(vMerkleBranch);
         READWRITE(nIndex);
     )
+
+    int64 GetCredit(bool fUseCache=false) const
+    {
+        // Must wait until coinbase is safely deep enough in the chain before valuing it
+        if (IsCoinBase() && GetBlocksToMaturity() > 0)
+            return 0;
+
+        // GetBalance can assume transactions in mapWallet won't change
+        if (fUseCache && fGetCreditCached)
+            return nGetCreditCached;
+        nGetCreditCached = CTransaction::GetCredit();
+        fGetCreditCached = true;
+        return nGetCreditCached;
+    }
 
 
     int SetMerkleBranch(const CBlock* pblock=NULL);
@@ -681,8 +706,9 @@ public:
     char fSpent;
     //// probably need to sign the order info so know it came from payer
 
-    // memory only
+    // memory only UI hints
     mutable unsigned int nTimeDisplayed;
+    mutable int nLinesDisplayed;
 
 
     CWalletTx()
@@ -707,6 +733,7 @@ public:
         fFromMe = false;
         fSpent = false;
         nTimeDisplayed = 0;
+        nLinesDisplayed = 0;
     }
 
     IMPLEMENT_SERIALIZE
@@ -729,6 +756,7 @@ public:
 
 
     int64 GetTxTime() const;
+    int GetRequestCount() const;
 
     void AddSupportingTransactions(CTxDB& txdb);
 
@@ -947,10 +975,18 @@ public:
             return error("CBlock::WriteToDisk() : ftell failed");
         fileout << *this;
 
+        // Flush stdio buffers and commit to disk before returning
+        fflush(fileout);
+#ifdef __WXMSW__
+        _commit(_fileno(fileout));
+#else
+        fsync(fileno(fileout));
+#endif
+
         return true;
     }
 
-    bool ReadFromDisk(unsigned int nFile, unsigned int nBlockPos, bool fReadTransactions)
+    bool ReadFromDisk(unsigned int nFile, unsigned int nBlockPos, bool fReadTransactions=true)
     {
         SetNull();
 
@@ -978,9 +1014,9 @@ public:
     void print() const
     {
         printf("CBlock(hash=%s, ver=%d, hashPrevBlock=%s, hashMerkleRoot=%s, nTime=%u, nBits=%08x, nNonce=%u, vtx=%d)\n",
-            GetHash().ToString().substr(0,14).c_str(),
+            GetHash().ToString().substr(0,16).c_str(),
             nVersion,
-            hashPrevBlock.ToString().substr(0,14).c_str(),
+            hashPrevBlock.ToString().substr(0,16).c_str(),
             hashMerkleRoot.ToString().substr(0,6).c_str(),
             nTime, nBits, nNonce,
             vtx.size());
@@ -999,7 +1035,7 @@ public:
     int64 GetBlockValue(int64 nFees) const;
     bool DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex);
     bool ConnectBlock(CTxDB& txdb, CBlockIndex* pindex);
-    bool ReadFromDisk(const CBlockIndex* blockindex, bool fReadTransactions);
+    bool ReadFromDisk(const CBlockIndex* blockindex, bool fReadTransactions=true);
     bool AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos);
     bool CheckBlock() const;
     bool AcceptBlock();
@@ -1128,7 +1164,7 @@ public:
         return strprintf("CBlockIndex(nprev=%08x, pnext=%08x, nFile=%d, nBlockPos=%-6d nHeight=%d, merkle=%s, hashBlock=%s)",
             pprev, pnext, nFile, nBlockPos, nHeight,
             hashMerkleRoot.ToString().substr(0,6).c_str(),
-            GetBlockHash().ToString().substr(0,14).c_str());
+            GetBlockHash().ToString().substr(0,16).c_str());
     }
 
     void print() const
@@ -1198,8 +1234,8 @@ public:
         str += CBlockIndex::ToString();
         str += strprintf("\n                hashBlock=%s, hashPrev=%s, hashNext=%s)",
             GetBlockHash().ToString().c_str(),
-            hashPrev.ToString().substr(0,14).c_str(),
-            hashNext.ToString().substr(0,14).c_str());
+            hashPrev.ToString().substr(0,16).c_str(),
+            hashNext.ToString().substr(0,16).c_str());
         return str;
     }
 
@@ -1267,6 +1303,27 @@ public:
         vHave.push_back(hashGenesisBlock);
     }
 
+    int GetDistanceBack()
+    {
+        // Retrace how far back it was in the sender's branch
+        int nDistance = 0;
+        int nStep = 1;
+        foreach(const uint256& hash, vHave)
+        {
+            map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hash);
+            if (mi != mapBlockIndex.end())
+            {
+                CBlockIndex* pindex = (*mi).second;
+                if (pindex->IsInMainChain())
+                    return nDistance;
+            }
+            nDistance += nStep;
+            if (nDistance > 10)
+                nStep *= 2;
+        }
+        return nDistance;
+    }
+
     CBlockIndex* GetBlockIndex()
     {
         // Find the first block the caller has in the main chain
@@ -1321,7 +1378,7 @@ public:
 
 extern map<uint256, CTransaction> mapTransactions;
 extern map<uint256, CWalletTx> mapWallet;
-extern vector<pair<uint256, bool> > vWalletUpdated;
+extern vector<uint256> vWalletUpdated;
 extern CCriticalSection cs_mapWallet;
 extern map<vector<unsigned char>, CPrivKey> mapKeys;
 extern map<uint160, vector<unsigned char> > mapPubKeys;

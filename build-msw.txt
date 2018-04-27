@@ -1,4 +1,4 @@
-BitCoin v0.1.5 ALPHA
+Bitcoin v0.2.0 BETA
 
 Copyright (c) 2009 Satoshi Nakamoto
 Distributed under the MIT/X11 software license, see the accompanying
@@ -8,21 +8,25 @@ the OpenSSL Toolkit (http://www.openssl.org/).  This product includes
 cryptographic software written by Eric Young (eay@cryptsoft.com).
 
 
+WINDOWS BUILD NOTES
+===================
+
 Compilers Supported
 -------------------
-MinGW GCC (v3.4.5)
+MinGW GCC
 Microsoft Visual C++ 6.0 SP6
 
 
 Dependencies
 ------------
-Libraries you need to obtain separately to build:
+Libraries you need to download separately and build:
 
               default path   download
-wxWidgets      \wxWidgets     http://www.wxwidgets.org/downloads/
-OpenSSL        \OpenSSL       http://www.openssl.org/source/
-Berkeley DB    \DB            http://www.oracle.com/technology/software/products/berkeley-db/index.html
-Boost          \Boost         http://www.boost.org/users/download/
+wxWidgets      \wxwidgets     http://www.wxwidgets.org/downloads/
+                                or prebuilt: http://wxpack.sourceforge.net
+OpenSSL        \openssl       http://www.openssl.org/source/
+Berkeley DB    \db            http://www.oracle.com/technology/software/products/berkeley-db/index.html
+Boost          \boost         http://www.boost.org/users/download/
 
 Their licenses:
 wxWidgets      LGPL 2.1 with very liberal exceptions
@@ -30,32 +34,49 @@ OpenSSL        Old BSD license with the problematic advertising requirement
 Berkeley DB    New BSD license with additional requirement that linked software must be free open source
 Boost          MIT-like license
 
+Versions used in this release:
+MinGW GCC    3.4.5
+wxWidgets    2.8.9
+OpenSSL      0.9.8k
+Berkeley DB  4.7.25.NC
+Boost        1.34.1
+
+
+Notes
+-----
+The UI layout is edited with wxFormBuilder.  The project file is
+uiproject.fbp.  It generates uibase.cpp and uibase.h, which define base
+classes that do the rote work of constructing all the UI elements.
+
+The release is built with GCC and then "strip bitcoin.exe" to strip the debug
+symbols, which reduces the executable size by about 90%.
+
 
 OpenSSL
 -------
 Bitcoin does not use any encryption.  If you want to do a no-everything
 build of OpenSSL to exclude encryption routines, a few patches are required.
-(OpenSSL v0.9.8h)
+(instructions for OpenSSL v0.9.8k)
 
-Edit engines\e_gmp.c and put this #ifndef around #include <openssl/rsa.h>
+Edit engines\e_gmp.c and engines\e_capi.c and add this #ifndef around
+the openssl/rsa.h include:
   #ifndef OPENSSL_NO_RSA
   #include <openssl/rsa.h>
   #endif
 
-Add this to crypto\err\err_all.c before the ERR_load_crypto_strings line:
-  void ERR_load_RSA_strings(void) { }
-
 Edit ms\mingw32.bat and replace the Configure line's parameters with this
 no-everything list.  You have to put this in the batch file because batch
-files can't handle more than 9 parameters.
+files can't take more than nine command line parameters.
   perl Configure mingw threads no-rc2 no-rc4 no-rc5 no-idea no-des no-bf no-cast no-aes no-camellia no-seed no-rsa no-dh
 
-Also REM out the following line in ms\mingw32.bat.  The build fails after it's
-already finished building libeay32, which is all we care about, but the
-failure aborts the script before it runs dllwrap to generate libeay32.dll.
+Also REM out the following line in ms\mingw32.bat after the mingw32-make
+line.  The build fails after it's already finished building libeay32, which
+is all we care about, but the failure aborts the script before it runs
+dllwrap to generate libeay32.dll.
   REM  if errorlevel 1 goto end
 
 Build
+  cd \openssl
   ms\mingw32.bat
 
 If you want to use it with MSVC, generate the .lib file
@@ -64,13 +85,7 @@ If you want to use it with MSVC, generate the .lib file
 
 Berkeley DB
 -----------
-MinGW with MSYS:
-cd \DB\build_unix
+Using MinGW and MSYS:
+cd \db\build_unix
 sh ../dist/configure --enable-mingw --enable-cxx
 make
-
-
-Boost
------
-You may need Boost version 1.35 to build with MSVC 6.0.  I couldn't get
-version 1.37 to compile with MSVC 6.0.

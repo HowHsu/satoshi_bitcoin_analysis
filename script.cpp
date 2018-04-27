@@ -936,10 +936,6 @@ bool Solver(const CScript& scriptPubKey, vector<pair<opcodetype, valtype> >& vSo
         CScript::const_iterator pc2 = script2.begin();
         loop
         {
-            /*
-                Author:HowHsu
-                Comments:CScript::GetOp(iterator& pc, opcodetype& opcodeRet, vector<unsigned char>& vchRet) is to get the opcode(in opcodeRet) and the operand(in vchRet),see the function implementation in script.h:473
-            */
             bool f1 = script1.GetOp(pc1, opcode1, vch1);
             bool f2 = script2.GetOp(pc2, opcode2, vch2);
             if (!f1 && !f2)
@@ -975,10 +971,7 @@ bool Solver(const CScript& scriptPubKey, vector<pair<opcodetype, valtype> >& vSo
     return false;
 }
 
-/*
-    Author:HowHsu
-    Comments:if hash equals 0,then we are not gonna sign but do some check(like CTxOut::IsMine)
-*/
+
 bool Solver(const CScript& scriptPubKey, uint256 hash, int nHashType, CScript& scriptSigRet)
 {
     scriptSigRet.clear();
